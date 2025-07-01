@@ -1234,12 +1234,16 @@ func validateMarkupAnnotationPart1(xRefTable *model.XRefTable, d types.Dict, dic
 	}
 
 	// CA, optional, number, since V1.4
-	if _, err := validateNumberEntry(xRefTable, d, dictName, "CA", OPTIONAL, model.V14, nil); err != nil {
+	sinceVersion := model.V14
+	if xRefTable.ValidationMode == model.ValidationRelaxed {
+		sinceVersion = model.V13
+	}
+	if _, err := validateNumberEntry(xRefTable, d, dictName, "CA", OPTIONAL, sinceVersion, nil); err != nil {
 		return err
 	}
 
 	// RC, optional, text string or stream, since V1.5
-	sinceVersion := model.V15
+	sinceVersion = model.V15
 	if xRefTable.ValidationMode == model.ValidationRelaxed {
 		sinceVersion = model.V13
 	}
