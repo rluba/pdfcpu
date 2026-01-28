@@ -44,10 +44,25 @@ import (
 func validateAppearanceSubDict(xRefTable *model.XRefTable, d types.Dict) error {
 
 	// dict of xobjects
-	for _, o := range d {
-
+	for name, o := range d {
 		if xRefTable.ValidationMode == model.ValidationRelaxed {
 			if d, ok := o.(types.Dict); ok && len(d) == 0 {
+				continue
+			}
+			if name == "Subtype" || name == "Type" {
+				// Fix: Some forms contain
+				// "/N": {
+				//     "/On": "206 0 R",
+				//     "/Subtype": "/Form",
+				//     "/Type": "/XObject"
+				// }
+				// instead of
+				// "/N": {
+				//     "/Off": "276 0 R",
+				//     "/On": "299 0 R"
+				// }
+				// And we don't want to choke on that
+				// -rluba, 2026-01-28
 				continue
 			}
 		}
