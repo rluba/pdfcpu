@@ -156,7 +156,6 @@ const (
 	RESETVIEWERPREFERENCES
 	ZOOM
 	ADDSIGNATURE
-	VALIDATESIGNATURE
 	LISTCERTIFICATES
 	INSPECTCERTIFICATES
 	IMPORTCERTIFICATES
@@ -273,6 +272,10 @@ type Configuration struct {
 
 	// Preferred certificate revocation checking mechanism: CRL, OSCP
 	PreferredCertRevocationChecker int
+
+	// Limit form field content for display purposes when using pdfcpu form list.
+	// If > 0 affects the columns AltName, Default and Value.
+	FormFieldListMaxColWidth int
 }
 
 // ConfigPath defines the location of pdfcpu's configuration directory.
@@ -340,7 +343,9 @@ func onlyHidden(files []os.DirEntry) bool {
 	return true
 }
 
-func initUserFonts() error {
+// ensureFontDirInitialized sets up the font directory without loading fonts.
+// Font loading is deferred until fonts are actually needed.
+func ensureFontDirInitialized() error {
 	files, err := os.ReadDir(font.UserFontDir)
 	if err != nil {
 		return err
@@ -357,14 +362,14 @@ func initUserFonts() error {
 		}
 	}
 
-	return font.LoadUserFonts()
+	return nil
 }
 
 func initCertificates() error {
-	// NOTE
-	// Load certs managed by The European Union Trusted Lists (EUTL) (https://eidas.ec.europa.eu/efda/trust-services/browse/eidas/tls).
+	// Install certs managed by The European Union Trusted Lists (EUTL) (https://eidas.ec.europa.eu/efda/trust-services/browse/eidas/tls).
+	// The embedded files are unpacked and stored into the pdfcpu config dir.
 	// Additional certificates may be loaded using the corresponding CLI command: pdfcpu certificates import
-	// Certificates will be loaded by corresponding commands where applicable.
+	// Certificates are loaded into memory lazily.
 
 	files, err := os.ReadDir(CertDir)
 	if err != nil {
@@ -421,14 +426,19 @@ func EnsureDefaultConfigAt(path string, override bool) error {
 		return err
 	}
 
+	// Initialize pdfcpu config/fonts dir for userfonts then extract and install Roboto as default Unicode font for form filling.
+	// Other userfonts have to be installed via `pdfcpu font install` or copied over from another pdfcpu config dir.
+	// Userfonts are loaded into memory lazily.
 	font.UserFontDir = filepath.Join(configDir, "fonts")
 	if err := os.MkdirAll(font.UserFontDir, os.ModePerm); err != nil {
 		return err
 	}
-	if err := initUserFonts(); err != nil {
+	if err := ensureFontDirInitialized(); err != nil {
 		return err
 	}
 
+	// Initialize pdfcpu config/cert dir, then extract and install certificates.
+	// Certificates are loaded into memory lazily.
 	CertDir = filepath.Join(configDir, "certs")
 	if err := os.MkdirAll(CertDir, os.ModePerm); err != nil {
 		return err
@@ -473,6 +483,7 @@ func newDefaultConfiguration() *Configuration {
 		Offline:                         false,
 		Timeout:                         5,
 		PreferredCertRevocationChecker:  CRL,
+		FormFieldListMaxColWidth:        0,
 	}
 }
 

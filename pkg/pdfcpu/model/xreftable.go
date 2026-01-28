@@ -221,6 +221,10 @@ func (xRefTable *XRefTable) Version() Version {
 	return *xRefTable.HeaderVersion
 }
 
+func (xRefTable *XRefTable) PDF20() bool {
+	return xRefTable.Version() == V20
+}
+
 // VersionString return a string representation for this PDF files PDF version.
 func (xRefTable *XRefTable) VersionString() string {
 	return xRefTable.Version().String()
@@ -242,7 +246,7 @@ func (xRefTable *XRefTable) ParseRootVersion() (v *string, err error) {
 // ValidateVersion validates against the xRefTable's version.
 func (xRefTable *XRefTable) ValidateVersion(element string, sinceVersion Version) error {
 	if xRefTable.Version() < sinceVersion {
-		return errors.Errorf("%s: unsupported in version %s\n", element, xRefTable.VersionString())
+		return errors.Errorf("%s: unsupported in version %s", element, xRefTable.VersionString())
 	}
 
 	return nil
@@ -436,6 +440,12 @@ func (xRefTable *XRefTable) InsertObject(obj types.Object) (objNr int, err error
 	xRefTableEntry := NewXRefTableEntryGen0(obj)
 	xRefTableEntry.RefCount = 1
 	return xRefTable.InsertNew(*xRefTableEntry), nil
+}
+
+// IndRefForNewObject inserts object at objNr into the xRefTable and returns an indirect reference to it.
+func (xRefTable *XRefTable) IndRefForObject(objNr int, obj types.Object) (*types.IndirectRef, error) {
+	xRefTable.Table[objNr] = NewXRefTableEntryGen0(obj)
+	return types.NewIndirectRef(objNr, 0), nil
 }
 
 // IndRefForNewObject inserts an object into the xRefTable and returns an indirect reference to it.
@@ -1014,7 +1024,10 @@ func (xRefTable *XRefTable) DereferenceXObjectDict(indRef types.IndirectRef) (*t
 	}
 
 	subType := sd.Dict.Subtype()
-	if subType == nil {
+	if subType == nil || len(*subType) == 0 {
+		if xRefTable.ValidationMode == ValidationRelaxed {
+			return sd, nil
+		}
 		return nil, errors.Errorf("pdfcpu: DereferenceXObjectDict: missing stream dict Subtype %s\n", indRef)
 	}
 
@@ -1688,7 +1701,9 @@ func (xRefTable *XRefTable) consolidateResources(obj types.Object, pAttrs *Inher
 			if err != nil {
 				return err
 			}
-			pAttrs.Resources[k] = o.Clone()
+			if o != nil {
+				pAttrs.Resources[k] = o.Clone()
+			}
 		}
 		if log.WriteEnabled() {
 			log.Write.Printf("pA:\n%s\n", pAttrs.Resources)
@@ -1793,6 +1808,23 @@ func (xRefTable *XRefTable) checkInheritedPageAttrs(pageDict types.Dict, pAttrs 
 	return xRefTable.consolidateResources(obj, pAttrs)
 }
 
+func (xRefTable *XRefTable) decodeContentStream(sd *types.StreamDict, pageNr int) error {
+	err := sd.Decode()
+	if err == filter.ErrUnsupportedFilter {
+		return errors.New("pdfcpu: unsupported filter: unable to decode content")
+	}
+	if err != nil {
+		if xRefTable.ValidationMode == ValidationStrict {
+			return errors.Errorf("page %d content decode: %v", pageNr, err)
+		}
+		if !strings.HasPrefix(err.Error(), "flate: corrupt input before offset") {
+			return errors.Errorf("page %d content decode: %v", pageNr, err)
+		}
+		ShowSkipped(fmt.Sprintf("page %d: corrupt content stream (flate)", pageNr))
+	}
+	return nil
+}
+
 // PageContent returns the content in PDF syntax for page dict d.
 func (xRefTable *XRefTable) PageContent(d types.Dict, pageNr int) ([]byte, error) {
 	o, _ := d.Find("Contents")
@@ -1811,14 +1843,9 @@ func (xRefTable *XRefTable) PageContent(d types.Dict, pageNr int) ([]byte, error
 
 	case types.StreamDict:
 		// no further processing.
-		err := o.Decode()
-		if err == filter.ErrUnsupportedFilter {
-			return nil, errors.New("pdfcpu: unsupported filter: unable to decode content")
+		if err := xRefTable.decodeContentStream(&o, pageNr); err != nil {
+			return nil, err
 		}
-		if err != nil {
-			return nil, errors.Errorf("page %d content decode: %v", pageNr, err)
-		}
-
 		bb = append(bb, o.Content...)
 
 	case types.Array:
@@ -1834,12 +1861,8 @@ func (xRefTable *XRefTable) PageContent(d types.Dict, pageNr int) ([]byte, error
 			if o == nil {
 				continue
 			}
-			err = o.Decode()
-			if err == filter.ErrUnsupportedFilter {
-				return nil, errors.New("pdfcpu: unsupported filter: unable to decode content")
-			}
-			if err != nil {
-				return nil, errors.Errorf("page %d content decode: %v", pageNr, err)
+			if err := xRefTable.decodeContentStream(o, pageNr); err != nil {
+				return nil, err
 			}
 			bb = append(bb, o.Content...)
 		}
@@ -1855,7 +1878,7 @@ func (xRefTable *XRefTable) PageContent(d types.Dict, pageNr int) ([]byte, error
 	return bb, nil
 }
 
-func consolidateResourceSubDict(d types.Dict, key string, prn PageResourceNames, pageNr int) error {
+func (xRefTable *XRefTable) consolidateResourceSubDict(d types.Dict, key string, prn PageResourceNames, pageNr int) error {
 	o := d[key]
 	if o == nil {
 		if prn.HasResources(key) {
@@ -1882,16 +1905,20 @@ func consolidateResourceSubDict(d types.Dict, key string, prn PageResourceNames,
 	// Check for missing resource sub dict entries.
 	for k := range res {
 		if !set[k] {
-			return errors.Errorf("pdfcpu: page %d: missing required %s: %s", pageNr, key, k)
+			s := fmt.Sprintf("page %d: missing required %s: %s", pageNr, key, k)
+			if xRefTable.ValidationMode == ValidationStrict {
+				return errors.New("pdfcpu: " + s)
+			}
+			ShowSkipped(s)
 		}
 	}
 	d[key] = d1
 	return nil
 }
 
-func consolidateResourceDict(d types.Dict, prn PageResourceNames, pageNr int) error {
+func (xRefTable *XRefTable) consolidateResourceDict(d types.Dict, prn PageResourceNames, pageNr int) error {
 	for k := range resourceTypes {
-		if err := consolidateResourceSubDict(d, k, prn, pageNr); err != nil {
+		if err := xRefTable.consolidateResourceSubDict(d, k, prn, pageNr); err != nil {
 			return err
 		}
 	}
@@ -1921,7 +1948,7 @@ func (xRefTable *XRefTable) consolidateResourcesWithContent(pageDict, resDict ty
 	// Remove any resource that's not required.
 	// Return an error for any required resource missing.
 	// TODO Calculate and accumulate resources required by content streams of any present form or type 3 fonts.
-	return consolidateResourceDict(resDict, prn, pageNr)
+	return xRefTable.consolidateResourceDict(resDict, prn, pageNr)
 }
 
 func (xRefTable *XRefTable) pageObjType(indRef types.IndirectRef) (string, error) {
@@ -2417,11 +2444,16 @@ func (xRefTable *XRefTable) PageDims() ([]types.Dim, error) {
 	return dims, nil
 }
 
-func (xRefTable *XRefTable) EmptyPage(parentIndRef *types.IndirectRef, mediaBox *types.Rectangle) (*types.IndirectRef, error) {
+func (xRefTable *XRefTable) EmptyPage(parentIndRef *types.IndirectRef, mediaBox *types.Rectangle, objNr int) (*types.IndirectRef, error) {
 	sd, _ := xRefTable.NewStreamDictForBuf(nil)
 
 	if err := sd.Encode(); err != nil {
 		return nil, err
+	}
+
+	arr := types.RectForFormat("A4").Array()
+	if mediaBox != nil {
+		arr = mediaBox.Array()
 	}
 
 	contentsIndRef, err := xRefTable.IndRefForNewObject(*sd)
@@ -2434,10 +2466,14 @@ func (xRefTable *XRefTable) EmptyPage(parentIndRef *types.IndirectRef, mediaBox 
 			"Type":      types.Name("Page"),
 			"Parent":    *parentIndRef,
 			"Resources": types.NewDict(),
-			"MediaBox":  mediaBox.Array(),
+			"MediaBox":  arr,
 			"Contents":  *contentsIndRef,
 		},
 	)
+
+	if objNr > 0 {
+		return xRefTable.IndRefForObject(objNr, pageDict)
+	}
 
 	return xRefTable.IndRefForNewObject(pageDict)
 }
@@ -2457,8 +2493,9 @@ func (xRefTable *XRefTable) pageMediaBox(d types.Dict) (*types.Rectangle, error)
 }
 
 func (xRefTable *XRefTable) emptyPage(parent *types.IndirectRef, d types.Dict, dim *types.Dim, pAttrs *InheritedPageAttrs) (*types.IndirectRef, error) {
+	// TODO cache empty page
 	if dim != nil {
-		return xRefTable.EmptyPage(parent, types.RectForDim(dim.Width, dim.Height))
+		return xRefTable.EmptyPage(parent, types.RectForDim(dim.Width, dim.Height), 0)
 	}
 
 	mediaBox, err := pAttrs.MediaBox, error(nil)
@@ -2469,8 +2506,7 @@ func (xRefTable *XRefTable) emptyPage(parent *types.IndirectRef, d types.Dict, d
 		}
 	}
 
-	// TODO cache empty page
-	return xRefTable.EmptyPage(parent, mediaBox)
+	return xRefTable.EmptyPage(parent, mediaBox, 0)
 }
 
 func (xRefTable *XRefTable) insertBlankPages(
@@ -2836,6 +2872,152 @@ func (xRefTable *XRefTable) RemoveSignature() {
 		d1["AcroForm"] = d2
 		delete(d1, "Extensions")
 	}
+}
+
+func removePageAnnotationForSig(xRefTable *XRefTable, pIndRef, indRef types.IndirectRef) error {
+	d, err := xRefTable.DereferenceDict(pIndRef)
+	if err != nil {
+		return err
+	}
+
+	obj, ok := d.Find("Annots")
+	if !ok {
+		return nil
+	}
+
+	annots, err := xRefTable.DereferenceArray(obj)
+	if err != nil || len(annots) == 0 {
+		return nil
+	}
+
+	arr := types.Array{}
+
+	for _, v := range annots {
+		if v != indRef {
+			arr = append(arr, v)
+		}
+	}
+
+	if len(arr) == 0 {
+		delete(d, "Annots")
+		return nil
+	}
+
+	d["Annots"] = arr
+	return nil
+}
+
+func removeSigAnnot(xRefTable *XRefTable, indRef types.IndirectRef, d types.Dict) error {
+	subType := d.Subtype()
+	if subType != nil && *subType == "Widget" {
+		if _, ok := d.Find("Rect"); !ok {
+			return nil
+		}
+		p := d.IndirectRefEntry("P")
+		if p == nil {
+			return nil
+		}
+		if err := removePageAnnotationForSig(xRefTable, *p, indRef); err != nil {
+			return err
+		}
+	}
+
+	// The widget annotation may be a kid.
+
+	kids := d.ArrayEntry("Kids")
+	if len(kids) != 1 {
+		return nil
+	}
+
+	indRef1, ok := kids[0].(types.IndirectRef)
+	if !ok {
+		return nil
+	}
+
+	d1, err := xRefTable.DereferenceDict(indRef1)
+	if err != nil || len(d1) == 0 {
+		return nil
+	}
+
+	subType = d1.Subtype()
+	if subType != nil && *subType == "Widget" {
+		if _, ok := d1.Find("Rect"); !ok {
+			return nil
+		}
+		p := d1.IndirectRefEntry("P")
+		if p == nil {
+			return nil
+		}
+		if err := removePageAnnotationForSig(xRefTable, *p, indRef1); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func (xRefTable *XRefTable) RemoveSignatures() error {
+	d := xRefTable.RootDict
+	delete(d, "DSS")
+	delete(d, "Legal")
+	delete(d, "Perm")
+	delete(d, "Extensions")
+
+	if xRefTable.Form == nil {
+		return nil
+	}
+
+	obj, ok := xRefTable.Form.Find("Fields")
+	if !ok || obj == nil {
+		delete(d, "AcroForm")
+		return nil
+	}
+
+	fields, err := xRefTable.DereferenceArray(obj)
+	if err != nil {
+		return err
+	}
+	if len(fields) == 0 {
+		delete(d, "AcroForm")
+		return nil
+	}
+
+	arr := types.Array{}
+
+	for _, v := range fields {
+		// NOTE validation has already taken care of the bad guys.
+		indRef, ok := v.(types.IndirectRef)
+		if !ok {
+			continue
+		}
+		d, err := xRefTable.DereferenceDict(indRef)
+		if err != nil {
+			continue
+		}
+		if len(d) == 0 {
+			continue
+		}
+		ft := d.NameEntry("FT")
+		if ft != nil && *ft != "Sig" {
+			arr = append(arr, indRef)
+			continue
+		}
+
+		if err := removeSigAnnot(xRefTable, indRef, d); err != nil {
+			return err
+		}
+	}
+
+	if len(arr) == 0 {
+		// Only Sigfields encountered.
+		delete(d, "AcroForm")
+		return nil
+	}
+
+	xRefTable.Form["Fields"] = arr // TODO need indRef?
+	delete(xRefTable.Form, "SigFlags")
+
+	return nil
 }
 
 func (xRefTable *XRefTable) BindPrinterPreferences(vp *ViewerPreferences, d types.Dict) {

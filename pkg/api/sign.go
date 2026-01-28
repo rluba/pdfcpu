@@ -140,9 +140,9 @@ func ValidateSignatures(inFile string, all bool, conf *model.Configuration) ([]*
 	if conf == nil {
 		conf = model.NewDefaultConfiguration()
 	}
-	conf.Cmd = model.VALIDATESIGNATURE
+	conf.Cmd = model.VALIDATESIGNATURES
 
-	if _, err := LoadCertificates(); err != nil {
+	if err := pdfcpu.LoadCertificates(); err != nil {
 		return nil, err
 	}
 

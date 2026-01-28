@@ -191,7 +191,7 @@ func CreateDCTImageStreamDict(xRefTable *XRefTable, buf []byte, w, h, bpc int, c
 		return nil, err
 	}
 
-	sd.Content = nil
+	//sd.Content = nil
 
 	sd.FilterPipeline = []types.PDFFilter{{Name: filter.DCT, DecodeParms: nil}}
 
@@ -327,6 +327,63 @@ func writeNRGBA64ImageBuf(xRefTable *XRefTable, img image.Image) ([]byte, []byte
 	return buf, sm
 }
 
+func writeSoftmask16(xRefTable *XRefTable, img *image.Alpha16) []byte {
+	w := img.Bounds().Dx()
+	h := img.Bounds().Dy()
+	var sm []byte
+	var softMask bool
+
+	for y := 0; y < h; y++ {
+		for x := 0; x < w; x++ {
+			c := img.Alpha16At(x, y)
+			if !softMask {
+				if xRefTable != nil && c.A != 0xFFFF {
+					softMask = true
+					sm = []byte{}
+					for j := 0; j < y*w+x; j++ {
+						sm = append(sm, 0xFF)
+						sm = append(sm, 0xFF)
+					}
+					sm = append(sm, uint8(c.A>>8))
+					sm = append(sm, uint8(c.A&0x00FF))
+				}
+			} else {
+				sm = append(sm, uint8(c.A>>8))
+				sm = append(sm, uint8(c.A&0x00FF))
+			}
+		}
+	}
+
+	return sm
+}
+
+func writeSoftmask(xRefTable *XRefTable, img *image.Alpha) []byte {
+	w := img.Bounds().Dx()
+	h := img.Bounds().Dy()
+	var sm []byte
+	var softMask bool
+
+	for y := 0; y < h; y++ {
+		for x := 0; x < w; x++ {
+			c := img.AlphaAt(x, y)
+			if !softMask {
+				if xRefTable != nil && c.A != 0xFF {
+					softMask = true
+					sm = []byte{}
+					for j := 0; j < y*w+x; j++ {
+						sm = append(sm, 0xFF)
+					}
+					sm = append(sm, uint8(c.A))
+				}
+			} else {
+				sm = append(sm, uint8(c.A))
+			}
+		}
+	}
+
+	return sm
+}
+
 func writeGrayImageBuf(img image.Image) []byte {
 	w := img.Bounds().Dx()
 	h := img.Bounds().Dy()
@@ -406,11 +463,57 @@ func convertNYCbCrAToRGBA(img *image.NYCbCrA) *image.RGBA {
 	return m
 }
 
-func convertToGray(img image.Image) *image.Gray {
+func extractAlpha(img image.Image) image.Image {
 	b := img.Bounds()
-	m := image.NewGray(image.Rect(0, 0, b.Dx(), b.Dy()))
-	draw.Draw(m, m.Bounds(), img, b.Min, draw.Src)
-	return m
+	cm := img.ColorModel()
+
+	if cm == color.RGBA64Model || cm == color.NRGBA64Model {
+		m := image.NewAlpha16(image.Rect(0, 0, b.Dx(), b.Dy()))
+		draw.Draw(m, m.Bounds(), img, b.Min, draw.Src)
+		return m
+	} else {
+		m := image.NewAlpha(image.Rect(0, 0, b.Dx(), b.Dy()))
+		draw.Draw(m, m.Bounds(), img, b.Min, draw.Src)
+		return m
+	}
+
+}
+
+func checkIfGray(img image.Image) bool {
+	cm := img.ColorModel()
+	if cm == color.Gray16Model || cm == color.GrayModel {
+		return true
+	}
+
+	m := convertToRGBA(img)
+	b := m.Bounds()
+
+	w := b.Dx()
+	h := b.Dy()
+
+	for y := 0; y < h; y++ {
+		for x := 0; x < w; x++ {
+			c := m.At(x, y).(color.RGBA)
+			if c.B != c.G || c.B != c.R {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func convertToGray(img image.Image) image.Image {
+	b := img.Bounds()
+	cm := img.ColorModel()
+	if cm == color.RGBA64Model || cm == color.NRGBA64Model {
+		m := image.NewGray16(image.Rect(0, 0, b.Dx(), b.Dy()))
+		draw.Draw(m, m.Bounds(), img, b.Min, draw.Src)
+		return m
+	} else {
+		m := image.NewGray(image.Rect(0, 0, b.Dx(), b.Dy()))
+		draw.Draw(m, m.Bounds(), img, b.Min, draw.Src)
+		return m
+	}
 }
 
 func convertToSepia(img image.Image) *image.RGBA {
@@ -469,91 +572,115 @@ func encodeJPEG(img image.Image) ([]byte, string, error) {
 	return buf.Bytes(), cs, err
 }
 
-func createImageBuf(xRefTable *XRefTable, img image.Image, format string) ([]byte, []byte, int, string, error) {
-	var buf []byte
-	var sm []byte // soft mask aka alpha mask
-	var bpc int
-	// TODO if dpi != 72 resample (applies to PNG,JPG,TIFF)
+func handleRGBImage(xRefTable *XRefTable, img image.Image) ([]byte, []byte, int, string, error) {
+	var (
+		buf, sm []byte
+		cs      = DeviceRGBCS
+		bpc     int
+	)
 
-	if format == "jpeg" {
-		bb, cs, err := encodeJPEG(img)
-		return bb, sm, 8, cs, err
-	}
-
-	var cs string
-
-	switch img := img.(type) {
+	switch im := img.(type) {
 	case *image.RGBA:
 		// A 32-bit alpha-premultiplied color, having 8 bits for each of red, green, blue and alpha.
 		// An alpha-premultiplied color component C has been scaled by alpha (A), so it has valid values 0 <= C <= A.
-		cs = DeviceRGBCS
 		bpc = 8
-		buf, sm = writeRGBAImageBuf(img)
+		buf, sm = writeRGBAImageBuf(im)
 
 	case *image.RGBA64:
 		// A 64-bit alpha-premultiplied color, having 16 bits for each of red, green, blue and alpha.
 		// An alpha-premultiplied color component C has been scaled by alpha (A), so it has valid values 0 <= C <= A.
-		cs = DeviceRGBCS
 		bpc = 16
-		buf = writeRGBA64ImageBuf(img)
+		buf = writeRGBA64ImageBuf(im)
 
 	case *image.NRGBA:
 		// Non-alpha-premultiplied 32-bit color.
-		cs = DeviceRGBCS
 		bpc = 8
-		buf, sm = writeNRGBAImageBuf(xRefTable, img)
+		buf, sm = writeNRGBAImageBuf(xRefTable, im)
 
 	case *image.NRGBA64:
 		// Non-alpha-premultiplied 64-bit color.
-		cs = DeviceRGBCS
 		bpc = 16
-		buf, sm = writeNRGBA64ImageBuf(xRefTable, img)
-
-	case *image.Alpha:
-		return buf, sm, bpc, cs, errors.New("pdfcpu: unsupported image type: Alpha")
-
-	case *image.Alpha16:
-		return buf, sm, bpc, cs, errors.New("pdfcpu: unsupported image type: Alpha16")
-
-	case *image.Gray:
-		// 8-bit grayscale color.
-		cs = DeviceGrayCS
-		bpc = 8
-		buf = writeGrayImageBuf(img)
-
-	case *image.Gray16:
-		// 16-bit grayscale color.
-		cs = DeviceGrayCS
-		bpc = 16
-		buf = writeGray16ImageBuf(img)
-
-	case *image.CMYK:
-		// Opaque CMYK color, having 8 bits for each of cyan, magenta, yellow and black.
-		cs = DeviceCMYKCS
-		bpc = 8
-		buf = writeCMYKImageBuf(img)
+		buf, sm = writeNRGBA64ImageBuf(xRefTable, im)
 
 	case *image.YCbCr:
-		cs = DeviceRGBCS
 		bpc = 8
-		buf, sm = writeRGBAImageBuf(convertToRGBA(img))
+		buf, sm = writeRGBAImageBuf(convertToRGBA(im))
 
 	case *image.NYCbCrA:
-		cs = DeviceRGBCS
 		bpc = 8
-		buf, sm = writeRGBAImageBuf(convertNYCbCrAToRGBA(img))
+		buf, sm = writeRGBAImageBuf(convertNYCbCrAToRGBA(im))
 
 	case *image.Paletted:
 		// In-memory image of uint8 indices into a given palette.
-		cs = DeviceRGBCS
 		bpc = 8
-		buf, sm = writeRGBAImageBuf(convertToRGBA(img))
-
-	default:
-		return buf, sm, bpc, cs, errors.Errorf("pdfcpu: unsupported image type: %T", img)
+		buf, sm = writeRGBAImageBuf(convertToRGBA(im))
 	}
 
 	return buf, sm, bpc, cs, nil
+}
+
+func handleGrayImage(xRefTable *XRefTable, img image.Image, imgA image.Image) ([]byte, []byte, int, string, error) {
+	var (
+		buf, sm []byte
+		cs      = DeviceGrayCS
+		bpc     int
+	)
+
+	writeSoftmaskIfNeeded := func() {
+		if imgA == nil {
+			return
+		}
+		switch a := imgA.(type) {
+		case *image.Alpha:
+			sm = writeSoftmask(xRefTable, a)
+		case *image.Alpha16:
+			sm = writeSoftmask16(xRefTable, a)
+		}
+	}
+
+	switch im := img.(type) {
+	case *image.Gray:
+		// 8-bit grayscale color.
+		bpc = 8
+		writeSoftmaskIfNeeded()
+		buf = writeGrayImageBuf(im)
+
+	case *image.Gray16:
+		// 16-bit grayscale color.
+		bpc = 16
+		writeSoftmaskIfNeeded()
+		buf = writeGray16ImageBuf(im)
+	}
+
+	return buf, sm, bpc, cs, nil
+}
+
+func handleCMYKImage(img *image.CMYK) ([]byte, []byte, int, string, error) {
+	// Opaque CMYK color, having 8 bits for each of cyan, magenta, yellow and black.
+	buf := writeCMYKImageBuf(img)
+	return buf, nil, 8, DeviceCMYKCS, nil
+}
+
+func createImageBuf(xRefTable *XRefTable, img image.Image, imgA image.Image, format string) ([]byte, []byte, int, string, error) {
+	if format == "jpeg" {
+		bb, cs, err := encodeJPEG(img)
+		return bb, nil, 8, cs, err
+	}
+
+	switch im := img.(type) {
+	case *image.RGBA, *image.RGBA64, *image.NRGBA, *image.NRGBA64,
+		*image.YCbCr, *image.NYCbCrA, *image.Paletted:
+		return handleRGBImage(xRefTable, im)
+
+	case *image.Gray, *image.Gray16:
+		return handleGrayImage(xRefTable, im, imgA)
+
+	case *image.CMYK:
+		return handleCMYKImage(im)
+
+	default:
+		return nil, nil, 0, "", errors.Errorf("pdfcpu: unsupported image type: %T", im)
+	}
 }
 
 func colorSpaceForJPEGColorModel(cm color.Model) string {
@@ -615,7 +742,7 @@ func decodeImage(xRefTable *XRefTable, buf *bytes.Reader, currentOffset int64, g
 		}
 	}
 
-	imgBuf, softMask, bpc, cs, err := createImageBuf(xRefTable, img, "tiff")
+	imgBuf, softMask, bpc, cs, err := createImageBuf(xRefTable, img, nil, "tiff")
 	if err != nil {
 		return 0, err
 	}
@@ -722,7 +849,7 @@ func createImageResources(xRefTable *XRefTable, c image.Config, bb bytes.Buffer,
 		}
 	}
 
-	imgBuf, softMask, bpc, cs, err := createImageBuf(xRefTable, img, format)
+	imgBuf, softMask, bpc, cs, err := createImageBuf(xRefTable, img, nil, format)
 	if err != nil {
 		return nil, err
 	}
@@ -774,36 +901,19 @@ func CreateImageResources(xRefTable *XRefTable, r io.Reader, gray, sepia bool) (
 	return createImageResources(xRefTable, c, bb, gray, sepia)
 }
 
-// CreateImageStreamDict returns a stream dict for image data represented by r and applies optional filters.
 func CreateImageStreamDict(xRefTable *XRefTable, r io.Reader) (*types.StreamDict, int, int, error) {
-
 	var bb bytes.Buffer
-	tee := io.TeeReader(r, &bb)
-
-	var sniff bytes.Buffer
-	if _, err := io.Copy(&sniff, tee); err != nil {
+	if _, err := io.Copy(&bb, r); err != nil {
 		return nil, 0, 0, err
 	}
+	data := bb.Bytes()
 
-	c, format, err := image.DecodeConfig(&sniff)
+	c, format, err := image.DecodeConfig(bytes.NewReader(data))
 	if err != nil {
 		return nil, 0, 0, err
 	}
 
-	if format == "jpeg" {
-		sd, err := createDCTImageStreamDictForJPEG(xRefTable, c, bb)
-		if err != nil {
-			return nil, 0, 0, err
-		}
-		return sd, c.Width, c.Height, nil
-	}
-
-	img, format, err := image.Decode(&bb)
-	if err != nil {
-		return nil, 0, 0, err
-	}
-
-	imgBuf, softMask, bpc, cs, err := createImageBuf(xRefTable, img, format)
+	img, _, err := image.Decode(bytes.NewReader(data))
 	if err != nil {
 		return nil, 0, 0, err
 	}
@@ -813,11 +923,56 @@ func CreateImageStreamDict(xRefTable *XRefTable, r io.Reader) (*types.StreamDict
 		return nil, 0, 0, errors.New("pdfcpu: unexpected width or height")
 	}
 
+	gray := checkIfGray(img)
+
+	if format == "jpeg" && !gray {
+		sd, err := createDCTImageStreamDictForJPEG(xRefTable, c, bb)
+		if err != nil {
+			return nil, 0, 0, err
+		}
+		return sd, w, h, nil
+	}
+
+	var imgA image.Image
+
+	if gray {
+		if hasAlpha(img.ColorModel()) {
+			imgA = extractAlpha(img)
+		}
+
+		switch img.(type) {
+		case *image.Gray, *image.Gray16:
+		default:
+			img = convertToGray(img)
+		}
+	}
+
+	imgBuf, softMask, bpc, cs, err := createImageBuf(xRefTable, img, imgA, format)
+	if err != nil {
+		return nil, 0, 0, err
+	}
+
 	sd, err := createImageStreamDict(xRefTable, imgBuf, softMask, w, h, bpc, format, cs)
 	if err != nil {
 		return nil, 0, 0, err
 	}
-	return sd, c.Width, c.Height, nil
+
+	return sd, w, h, nil
+}
+
+func hasAlpha(cm color.Model) bool {
+	switch cm {
+	case color.Alpha16Model,
+		color.AlphaModel,
+		color.NYCbCrAModel,
+		color.RGBA64Model,
+		color.NRGBA64Model,
+		color.NRGBAModel,
+		color.RGBAModel:
+		return true
+	default:
+		return false
+	}
 }
 
 // CreateImageResource creates a new XObject for given image data represented by r and applies optional filters.
